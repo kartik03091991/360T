@@ -1,0 +1,149 @@
+Requirement B
+ 
+
+To handle Requirement B efficiently—where there are 300 currency pairs and the job runs every 1 minute—we need to focus on:
+1.	Performance Optimization for handling larger datasets.
+2.	Ensuring that the event scheduler can queue events correctly without overlap.
+3.	Adding scalability improvements to accommodate higher data volume and execution frequency.
+
+Key Changes in the Solution
+1. Optimized Query Execution
+•	Use indexes effectively to minimize table scans.
+•	Limit the result set by filtering data early.
+•	Use temporary tables or intermediate tables to avoid recalculating the same data.
+2. Avoid Overlapping Execution
+•	Ensure the next event does not overlap with the current one. Use locking or a queuing mechanism.
+•	Reduce query runtime to stay within the 1-minute execution window.
+3. Incremental Execution
+•	Process only new data or the latest data since the last run, rather than scanning the entire table.
+
+Proposed Changes to the Implementation
+1. Table and Index Optimization
+Ensure the following indexes exist to speed up query execution:
+
+CREATE INDEX idx_event_time ON Currency_Exchange.forex_batch_processing_2_day (event_time);
+CREATE INDEX idx_ccy_couple ON Currency_Exchange.forex_batch_processing_2_day (ccy_couple);
+
+2. Use Temporary Tables
+We will use a temporary table to store the most recent active rates to minimize redundant calculations.
+
+3. Updated Stored Procedure
+Here is the optimized stored procedure to handle 300 currency pairs efficiently:
+
+DELIMITER $$
+
+CREATE PROCEDURE GetActiveRates_Optimized()
+BEGIN
+    DECLARE rows_affected INT DEFAULT 0;
+
+    -- Define trigger time dynamically for the current execution
+    SET @trigger_time = UNIX_TIMESTAMP(NOW()) * 1000;
+
+    -- Step 1: Create a temporary table for the most recent rates (ActiveRates)
+    CREATE TEMPORARY TABLE TempMostRecentRates AS
+    SELECT 
+        ccy_couple, 
+        rate AS current_rate,
+        event_time
+    FROM (
+        SELECT
+            ccy_couple,
+            rate,
+            event_time,
+            ROW_NUMBER() OVER (PARTITION BY ccy_couple ORDER BY event_time DESC) AS rnk
+        FROM Currency_Exchange.forex_batch_processing_2_day
+        WHERE event_time >= @trigger_time - 30000 -- Only last 30 seconds
+    ) AS subquery
+    WHERE rnk = 1;
+
+    -- Step 2: Find yesterday's rates at 5 PM New York time
+    CREATE TEMPORARY TABLE TempYesterdayRates AS
+    SELECT 
+        ccy_couple, 
+        rate AS yesterday_rate
+    FROM (
+        SELECT
+            ccy_couple,
+            rate,
+            event_time,
+            ROW_NUMBER() OVER (
+                PARTITION BY ccy_couple
+                ORDER BY ABS(event_time - UNIX_TIMESTAMP(DATE_SUB(NOW(), INTERVAL 1 DAY) + INTERVAL 17 HOUR) * 1000) ASC
+            ) AS rnk
+        FROM Currency_Exchange.forex_batch_processing_2_day
+        WHERE event_time BETWEEN 
+            UNIX_TIMESTAMP(DATE_SUB(NOW(), INTERVAL 1 DAY) + INTERVAL 17 HOUR - INTERVAL 1 HOUR) * 1000 
+            AND 
+            UNIX_TIMESTAMP(DATE_SUB(NOW(), INTERVAL 1 DAY) + INTERVAL 17 HOUR + INTERVAL 1 HOUR) * 1000
+    ) AS subquery
+    WHERE rnk = 1;
+
+    -- Step 3: Insert into active_rates_log and calculate percentage change
+    INSERT INTO Currency_Exchange.active_rates_log (ccy_couple, current_rate, percentage_change)
+    SELECT 
+        mr.ccy_couple,
+        mr.current_rate,
+        CONCAT(ROUND((mr.current_rate - yr.yesterday_rate) / yr.yesterday_rate * 100, 3), '%') AS percentage_change
+    FROM TempMostRecentRates mr
+    JOIN TempYesterdayRates yr ON mr.ccy_couple = yr.ccy_couple;
+
+    -- Log execution metadata
+    SET rows_affected = ROW_COUNT();
+    INSERT INTO Currency_Exchange.procedure_execution_log (procedure_name, rows_affected, execution_status)
+    VALUES ('GetActiveRates_Optimized', rows_affected, 'SUCCESS');
+
+    -- Cleanup temporary tables
+    DROP TEMPORARY TABLE IF EXISTS TempMostRecentRates;
+    DROP TEMPORARY TABLE IF EXISTS TempYesterdayRates;
+
+END$$
+
+DELIMITER ;
+
+Optimizations in the Above Solution
+1.	Temporary Tables:
+o	Temporary tables store intermediate results (TempMostRecentRates and TempYesterdayRates).
+o	This avoids recalculating subqueries repeatedly and speeds up joins.
+2.	Indexes:
+o	Indexes on ccy_couple and event_time improve lookup and filtering performance.
+3.	Row-Level Filtering:
+o	Filters data early in the WHERE clause to avoid scanning unnecessary rows.
+4.	Logging and Error Handling:
+o	Rows affected are logged for monitoring.
+o	Stored procedure ensures proper cleanup of temporary tables.
+
+4. Schedule the Event to Avoid Overlaps
+To prevent overlapping executions of the event, queue the event or ensure each execution finishes before the next one.
+Schedule the event with a 1-minute interval:
+
+CREATE EVENT Currency_Exchange.GetActiveRates_Optimized
+ON SCHEDULE EVERY 1 MINUTE
+STARTS TIMESTAMP(NOW() + INTERVAL 2 MINUTE)
+DO
+CALL Currency_Exchange.GetActiveRates_Optimized();
+
+5. Monitor Event Execution
+Check scheduled events to ensure proper execution:
+
+SHOW EVENTS FROM Currency_Exchange;
+Verify execution status and rows affected in the procedure_execution_log table:
+
+SELECT * FROM Currency_Exchange.procedure_execution_log ORDER BY execution_time DESC;
+
+Further Scalability Suggestions
+1.	Partitioning:
+o	Partition the forex_batch_processing_2_day table based on event_time or ccy_couple to improve query performance for large datasets.
+Example:
+sql
+
+ALTER TABLE Currency_Exchange.forex_batch_processing_2_day 
+PARTITION BY RANGE (event_time) (
+    PARTITION p1 VALUES LESS THAN (UNIX_TIMESTAMP('2024-12-15 00:00:00') * 1000),
+    PARTITION p2 VALUES LESS THAN (MAXVALUE)
+);
+2.	Parallel Execution:
+o	Use multiple stored procedures or threads to process currency pairs in batches (e.g., split 300 pairs into 3 groups of 100).
+3.	Incremental Updates:
+o	Track the last_event_time processed and only fetch new rows since that time to reduce query workload.
+4.	Buffering Results:
+o	Precompute results for active rates in a buffer table for faster access during high-frequency jobs.
